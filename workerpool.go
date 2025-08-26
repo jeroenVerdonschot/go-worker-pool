@@ -10,8 +10,8 @@ import (
 	"time"
 )
 
-// PoolProcessor is the interface that jobs must implement to be processed by the worker pool
-type PoolProcessor interface {
+// JobProcessor is the interface that jobs must implement to be processed by the worker pool
+type JobProcessor interface {
 	Process(ctx context.Context) error
 	GetID() string
 }
@@ -46,7 +46,7 @@ type Worker struct {
 // Pool manages a collection of workers and distributes jobs to them
 type Pool struct {
 	workers      []*Worker
-	jobQueue     chan PoolProcessor
+	jobQueue     chan JobProcessor
 	workerWg     sync.WaitGroup
 	jobWg        sync.WaitGroup
 	ctx          context.Context
@@ -88,7 +88,7 @@ func NewPool(numWorkers int, queueSize int, maxErrors int, logger *slog.Logger, 
 	pool := &Pool{
 		ctx:       ctx,
 		cancel:    cancel,
-		jobQueue:  make(chan PoolProcessor, queueSize),
+		jobQueue:  make(chan JobProcessor, queueSize),
 		queueSize: queueSize,
 		maxErrors: maxErrors,
 		errors:    make([]ErrorEntry, 0, maxErrors),
@@ -114,8 +114,16 @@ func NewPool(numWorkers int, queueSize int, maxErrors int, logger *slog.Logger, 
 	return pool
 }
 
-// Add submits a new job to the pool
-func (p *Pool) Add(job PoolProcessor) error {
+// Add submits a new job to the pool.
+//
+// JobProcessor is an interface that jobs must implement. It requires:
+//   - Process(ctx context.Context) error: contains the logic to process the job.
+//   - GetID() string: returns a unique identifier for the job.
+//
+// To use the pool, define a struct that implements JobProcessor.
+//   - The struct should hold any data needed for your job. Most of the time this contains a FAN-IN channel.
+//   - Implement the Process method with your job logic, and
+func (p *Pool) Add(job JobProcessor) error {
 	if job == nil {
 		return fmt.Errorf("job cannot be nil")
 	}
@@ -131,7 +139,7 @@ func (p *Pool) Add(job PoolProcessor) error {
 }
 
 // AddBatch adds multiple jobs to the pool at once
-func (p *Pool) AddBatch(jobs []PoolProcessor) error {
+func (p *Pool) AddBatch(jobs []JobProcessor) error {
 	for _, job := range jobs {
 		if err := p.Add(job); err != nil {
 			return fmt.Errorf("failed to add job %s: %w", job.GetID(), err)
@@ -153,6 +161,13 @@ func (p *Pool) Stop() {
 	p.shutdownOnce.Do(func() {
 		p.cancel()
 		p.workerWg.Wait()
+		close(p.jobQueue)
+	})
+}
+
+func (p *Pool) Abort() {
+	p.shutdownOnce.Do(func() {
+		p.cancel()
 		close(p.jobQueue)
 	})
 }
@@ -207,11 +222,11 @@ func (p *Pool) recordError(jobID string, err error, workerID int, isPanic bool) 
 		IsPanic:   isPanic,
 	}
 
-	// Maintain a circular buffer for errors
-	if len(p.errors) >= p.maxErrors {
-		p.errors = append(p.errors[1:], entry)
-	} else {
-		p.errors = append(p.errors, entry)
+	p.errors = append(p.errors, entry)
+
+	if len(p.errors) > p.maxErrors {
+		p.logger.Error("Maximum error limit reached, stopping pool", slog.Int("maxErrors", p.maxErrors))
+		p.Abort()
 	}
 }
 
@@ -240,7 +255,7 @@ func (w *Worker) start() {
 	}
 }
 
-func (w *Worker) processJob(job PoolProcessor) {
+func (w *Worker) processJob(job JobProcessor) {
 	atomic.AddInt32(&w.pool.activeWorkers, 1)
 	defer func() {
 		atomic.AddInt32(&w.pool.activeWorkers, -1)
